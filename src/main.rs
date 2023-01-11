@@ -1,8 +1,17 @@
-use miden_crypto::hash::rpo::Rpo256;
+#![feature(allocator_api)]
+
+use elsa::FrozenVec;
+use gpu_poly::{
+    plan::{gen_rpo_merkle_tree, GpuRpo128},
+    prelude::PageAlignedAllocator,
+    GpuVec,
+};
+use miden_crypto::hash::rpo::{Rpo256, RpoDigest};
 use prover::{
     crypto::{hashers::Blake3_256, Digest, ElementHasher},
     iterators::*,
     math::{
+        fft,
         fields::{f64::BaseElement as Felt, CubeExtension, QuadExtension},
         log2, FieldElement,
     },
@@ -17,10 +26,27 @@ pub fn main() {
     // read command-line args
     let options = BenchOptions::from_args();
 
+    println!(
+        "WHTTT: {}, {}",
+        Felt::ONE,
+        Rpo256::hash_elements(&[
+            Felt::ONE,
+            Felt::ONE,
+            Felt::ONE,
+            Felt::ONE,
+            Felt::ONE,
+            Felt::ONE,
+            Felt::ONE,
+            Felt::ONE
+        ])[0]
+    );
+
     match (options.hash_fn.as_str(), options.extension_degree) {
         ("blake3", 1) => run_benchmarks::<Felt, Blake3_256<Felt>>(options),
         ("blake3", 2) => run_benchmarks::<QuadExtension<Felt>, Blake3_256<Felt>>(options),
         ("blake3", 3) => run_benchmarks::<CubeExtension<Felt>, Blake3_256<Felt>>(options),
+        ("rpo_gpu", 1) => run_rpo_gpu_benchmarks(options),
+        ("rpo_gpu_interleaved", 1) => run_rpo_gpu_interleaved_benchmarks(options),
         ("rpo", 1) => run_benchmarks::<Felt, Rpo256>(options),
         ("rpo", 2) => run_benchmarks::<QuadExtension<Felt>, Rpo256>(options),
         ("rpo", 3) => run_benchmarks::<CubeExtension<Felt>, Rpo256>(options),
@@ -96,6 +122,174 @@ where
     );
 
     println!("Merkle tree root: {}", hex::encode(tree.root().as_bytes()));
+
+    println!("total runtime {overall_result:.2} sec");
+}
+
+fn run_rpo_gpu_benchmarks(options: BenchOptions) {
+    let now = Instant::now();
+    let domain = build_domain(options.num_cols, options.log_n_rows, options.blowup);
+    //let trace = build_rand_matrix::<E>(options.num_cols, options.log_n_rows);
+    let trace = build_fib_matrix::<Felt>(options.num_cols, options.log_n_rows);
+    println!(
+        "prepared benchmark inputs in {:.2} sec",
+        now.elapsed().as_millis() as f64 / 1000_f64
+    );
+
+    // perform interpolation
+    let start = Instant::now();
+    let polys = trace.interpolate_columns();
+    let interpolate_result = start.elapsed().as_millis() as f64 / 1000_f64;
+
+    // perform evaluation
+    let eval_start = Instant::now();
+    let extended_trace = polys.evaluate_columns_over(&domain);
+    let eval_result = eval_start.elapsed().as_millis() as f64 / 1000_f64;
+    let lde_result = start.elapsed().as_millis() as f64 / 1000_f64;
+    let extended_cols = extended_trace
+        .columns()
+        .map(|col| col.to_vec_in(PageAlignedAllocator))
+        .collect::<Vec<GpuVec<Felt>>>();
+
+    // build Merkle tree
+    let mtree_start = Instant::now();
+
+    let requires_padding = extended_trace.num_cols() % Rpo256::RATE_RANGE.size_hint().0 != 0;
+    // generate leaf nodes
+    let mut row_hasher = GpuRpo128::<Felt>::new(extended_trace.num_rows(), requires_padding);
+    extended_cols.iter().for_each(|col| row_hasher.update(col));
+    let leaf_nodes = pollster::block_on(row_hasher.finish());
+
+    // generate merkle tree
+    let tree = pollster::block_on(gen_rpo_merkle_tree(&leaf_nodes));
+    let mtree_result = mtree_start.elapsed().as_millis() as f64 / 1000_f64;
+    let overall_result = start.elapsed().as_millis() as f64 / 1000_f64;
+
+    // print out results
+    println!(
+        "interpolated {} columns of length 2^{} into polynomials in {:.2} sec",
+        trace.num_cols(),
+        log2(trace.num_rows()),
+        interpolate_result
+    );
+
+    println!(
+        "evaluated {} polynomials of length 2^{} over domain 2^{} in {:.2} sec",
+        extended_trace.num_cols(),
+        log2(polys.num_rows()),
+        log2(extended_trace.num_rows()),
+        eval_result,
+    );
+
+    println!(
+        "extended {} columns from 2^{} to 2^{} ({}x blowup) in {:.2} sec",
+        trace.num_cols(),
+        log2(trace.num_rows()),
+        log2(extended_trace.num_rows()),
+        domain.trace_to_lde_blowup(),
+        lde_result
+    );
+
+    println!(
+        "built Merkle tree from a matrix with {} columns and 2^{} rows using {} hash function in {:.2} sec",
+        extended_trace.num_cols(),
+        log2(extended_trace.num_rows()),
+        options.hash_fn,
+        mtree_result
+    );
+
+    println!(
+        "Merkle tree root: {}",
+        hex::encode(RpoDigest::new(tree[1]).as_bytes())
+    );
+
+    println!("total runtime {overall_result:.2} sec");
+}
+
+// Interleave low degree extension with merkle tree generation
+fn run_rpo_gpu_interleaved_benchmarks(options: BenchOptions) {
+    let now = Instant::now();
+    let domain = build_domain(options.num_cols, options.log_n_rows, options.blowup);
+    //let trace = build_rand_matrix::<E>(options.num_cols, options.log_n_rows);
+    let trace = build_fib_matrix::<Felt>(options.num_cols, options.log_n_rows);
+    println!(
+        "prepared benchmark inputs in {:.2} sec",
+        now.elapsed().as_millis() as f64 / 1000_f64
+    );
+
+    // perform interpolation
+    let start = Instant::now();
+    let polys = trace.interpolate_columns();
+    let interpolate_result = start.elapsed().as_millis() as f64 / 1000_f64;
+
+    // perform evaluation
+    let eval_start = Instant::now();
+    let requires_padding = polys.num_cols() % Rpo256::RATE_RANGE.size_hint().0 != 0;
+    let mut row_hasher = GpuRpo128::<Felt>::new(domain.lde_domain_size(), requires_padding);
+    let eval_columns = FrozenVec::new();
+    for col in 0..polys.num_cols() {
+        let poly = polys.get_column(col);
+        let evals = Box::new(
+            fft::evaluate_poly_with_offset(
+                poly,
+                domain.trace_twiddles(),
+                domain.offset(),
+                domain.trace_to_lde_blowup(),
+            )
+            .to_vec_in(PageAlignedAllocator),
+        );
+        row_hasher.update(eval_columns.push_get(evals));
+    }
+    let eval_result = eval_start.elapsed().as_millis() as f64 / 1000_f64;
+    let lde_result = start.elapsed().as_millis() as f64 / 1000_f64;
+    let extended_trace = Matrix::new(eval_columns.iter().map(|c| c.to_vec()).collect());
+
+    // build Merkle tree
+    let mtree_start = Instant::now();
+    // generate leaf nodes
+    let leaf_nodes = pollster::block_on(row_hasher.finish());
+    // generate internal merkle tree nodes
+    let tree = pollster::block_on(gen_rpo_merkle_tree(&leaf_nodes));
+    let mtree_result = mtree_start.elapsed().as_millis() as f64 / 1000_f64;
+    let overall_result = start.elapsed().as_millis() as f64 / 1000_f64;
+
+    // print out results
+    println!(
+        "interpolated {} columns of length 2^{} into polynomials in {:.2} sec",
+        trace.num_cols(),
+        log2(trace.num_rows()),
+        interpolate_result
+    );
+
+    println!(
+        "evaluated {} polynomials of length 2^{} over domain 2^{} in {:.2} sec",
+        extended_trace.num_cols(),
+        log2(polys.num_rows()),
+        log2(extended_trace.num_rows()),
+        eval_result,
+    );
+
+    println!(
+        "extended {} columns from 2^{} to 2^{} ({}x blowup) in {:.2} sec",
+        trace.num_cols(),
+        log2(trace.num_rows()),
+        log2(extended_trace.num_rows()),
+        domain.trace_to_lde_blowup(),
+        lde_result
+    );
+
+    println!(
+        "built Merkle tree from a matrix with {} columns and 2^{} rows using {} hash function in {:.2} sec",
+        extended_trace.num_cols(),
+        log2(extended_trace.num_rows()),
+        options.hash_fn,
+        mtree_result
+    );
+
+    println!(
+        "Merkle tree root: {}",
+        hex::encode(RpoDigest::new(tree[1]).as_bytes())
+    );
 
     println!("total runtime {overall_result:.2} sec");
 }

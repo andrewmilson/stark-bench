@@ -11,5 +11,8 @@ path = "src/main.rs"
 hex = { version = "0.4" }
 miden-crypto = { package = "miden-crypto", version = "0.1" }
 prover = { package = "winter-prover", version = "0.4.2", features = ["concurrent"] }
+gpu-poly = { path = "../ministark/gpu-poly", features = [ "winterfell" ] }
+elsa = "1.7.0"
 rand-utils = { package = "winter-rand-utils", version = "0.4.2" }
 structopt = { version = "0.3", default-features = false }
+pollster = "0.2.4"
