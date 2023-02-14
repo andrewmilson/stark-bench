@@ -2,7 +2,7 @@
 
 use elsa::FrozenVec;
 use gpu_poly::{
-    plan::{gen_rpo_merkle_tree, GpuRpo128},
+    plan::{gen_rpo_merkle_tree, GpuRpo256ColumnMajor},
     prelude::PageAlignedAllocator,
     GpuVec,
 };
@@ -25,21 +25,6 @@ use structopt::StructOpt;
 pub fn main() {
     // read command-line args
     let options = BenchOptions::from_args();
-
-    println!(
-        "WHTTT: {}, {}",
-        Felt::ONE,
-        Rpo256::hash_elements(&[
-            Felt::ONE,
-            Felt::ONE,
-            Felt::ONE,
-            Felt::ONE,
-            Felt::ONE,
-            Felt::ONE,
-            Felt::ONE,
-            Felt::ONE
-        ])[0]
-    );
 
     match (options.hash_fn.as_str(), options.extension_degree) {
         ("blake3", 1) => run_benchmarks::<Felt, Blake3_256<Felt>>(options),
@@ -156,7 +141,8 @@ fn run_rpo_gpu_benchmarks(options: BenchOptions) {
 
     let requires_padding = extended_trace.num_cols() % Rpo256::RATE_RANGE.size_hint().0 != 0;
     // generate leaf nodes
-    let mut row_hasher = GpuRpo128::<Felt>::new(extended_trace.num_rows(), requires_padding);
+    let mut row_hasher =
+        GpuRpo256ColumnMajor::<Felt>::new(extended_trace.num_rows(), requires_padding);
     extended_cols.iter().for_each(|col| row_hasher.update(col));
     let leaf_nodes = pollster::block_on(row_hasher.finish());
 
@@ -219,19 +205,17 @@ fn run_rpo_gpu_interleaved_benchmarks(options: BenchOptions) {
 
     // perform interpolation
     let start = Instant::now();
-    let polys = trace.interpolate_columns();
-    let interpolate_result = start.elapsed().as_millis() as f64 / 1000_f64;
-
-    // perform evaluation
-    let eval_start = Instant::now();
-    let requires_padding = polys.num_cols() % Rpo256::RATE_RANGE.size_hint().0 != 0;
-    let mut row_hasher = GpuRpo128::<Felt>::new(domain.lde_domain_size(), requires_padding);
+    let requires_padding = trace.num_cols() % Rpo256::RATE_RANGE.size_hint().0 != 0;
+    let mut row_hasher =
+        GpuRpo256ColumnMajor::<Felt>::new(domain.lde_domain_size(), requires_padding);
     let eval_columns = FrozenVec::new();
-    for col in 0..polys.num_cols() {
-        let poly = polys.get_column(col);
+    let inv_twiddles = fft::get_inv_twiddles::<Felt>(trace.num_rows());
+    for i in 0..trace.num_cols() {
+        let mut column = trace.get_column(i).to_vec();
+        fft::interpolate_poly(&mut column, &inv_twiddles);
         let evals = Box::new(
             fft::evaluate_poly_with_offset(
-                poly,
+                &column,
                 domain.trace_twiddles(),
                 domain.offset(),
                 domain.trace_to_lde_blowup(),
@@ -240,7 +224,6 @@ fn run_rpo_gpu_interleaved_benchmarks(options: BenchOptions) {
         );
         row_hasher.update(eval_columns.push_get(evals));
     }
-    let eval_result = eval_start.elapsed().as_millis() as f64 / 1000_f64;
     let lde_result = start.elapsed().as_millis() as f64 / 1000_f64;
     let extended_trace = Matrix::new(eval_columns.iter().map(|c| c.to_vec()).collect());
 
@@ -253,24 +236,8 @@ fn run_rpo_gpu_interleaved_benchmarks(options: BenchOptions) {
     let mtree_result = mtree_start.elapsed().as_millis() as f64 / 1000_f64;
     let overall_result = start.elapsed().as_millis() as f64 / 1000_f64;
 
-    // print out results
     println!(
-        "interpolated {} columns of length 2^{} into polynomials in {:.2} sec",
-        trace.num_cols(),
-        log2(trace.num_rows()),
-        interpolate_result
-    );
-
-    println!(
-        "evaluated {} polynomials of length 2^{} over domain 2^{} in {:.2} sec",
-        extended_trace.num_cols(),
-        log2(polys.num_rows()),
-        log2(extended_trace.num_rows()),
-        eval_result,
-    );
-
-    println!(
-        "extended {} columns from 2^{} to 2^{} ({}x blowup) in {:.2} sec",
+        "interpolated and extended {} columns from 2^{} to 2^{} ({}x blowup) in {:.2} sec",
         trace.num_cols(),
         log2(trace.num_rows()),
         log2(extended_trace.num_rows()),
